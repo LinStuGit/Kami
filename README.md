@@ -114,6 +114,29 @@ WeClaude 用 **~2000 行 Python**，直接把微信 ClawBot 和 Claude Code CLI 
 
 为每个用户设置独立的 Claude 行为风格，持久化保存。
 
+### 7. 文件收发
+
+```
+接收：微信发文件 ──→ 自动下载到 media/ ──→ Claude 直接读取处理
+发送：让 Claude 生成文件并在回复里写 [[file: /绝对路径]] ──→ 自动通过微信发送
+手动：/send <本地路径>      ← 把电脑上的任意文件发到微信
+查看：/files                ← 列出最近收到的 10 个文件
+```
+
+发送链路与官方 openclaw-weixin 插件一致：`getuploadurl` 预签名 → AES-128-ECB 加密 → CDN 上传 → `sendmessage` file_item。上限 100 MB。
+
+### 8. 双模型路由 — 快问本地小模型，大任务 Claude
+
+```
+/mode auto        ← 默认：寒暄/短问题 → 本地模型（~1.5s），复杂任务 → Claude
+/mode fast        ← 全部走本地模型
+/mode pro         ← 全部走 Claude
+!消息前缀          ← 单条强制走 Claude
+```
+
+本地模型由守护进程托管 `llama-server`（127.0.0.1:8899，OpenAI 兼容接口，GPU 全量 offload）；
+本地不可用时自动回退 Claude。启发式路由偏保守——含任务动词（写/生成/修复/分析…）的消息一律走 Claude。
+
 ---
 
 <a id="quick-start"></a>
@@ -315,6 +338,65 @@ OpenClaw 是完整的 AI 助手平台（200K+ 行代码），WeClaude 只做一�
 
 所有数据存储在你本地电脑上，不经过任何第三方服务器。代码完全开源，~2000 行可以完整审计。
 </details>
+
+---
+
+## Daemon (Windows)
+
+用 `daemon.py` 把 bridge 跑成后台守护进程：崩溃自动拉起（指数退避）、日志落盘（`logs/weclaude.log`，5MB 轮转）。同时守护 **CC Switch**：每 30 秒检测一次，发现没在运行就自动打开（你手动打开的实例不会被干扰）。
+
+```bash
+python daemon.py login              # 首次：扫码登录（前台，需真实终端）
+python daemon.py start              # 后台启动守护进程（bridge + CC Switch）
+python daemon.py status             # 查看状态（daemon / bridge / ccswitch）
+python daemon.py restart -w ~/proj  # 重启并指定 Claude 工作目录
+python daemon.py stop               # 停止
+python daemon.py foreground         # 前台运行 supervisor（调试用）
+python daemon.py start --no-ccswitch        # 不管理 CC Switch
+python daemon.py start --ccswitch PATH\to\cc-switch.exe  # 指定 CC Switch 路径
+python daemon.py install-autostart  # Windows 登录时自动启动（schtasks）
+python daemon.py uninstall-autostart
+```
+
+崩溃重启策略：bridge 连续崩溃时间隔按 2^n 秒退避（上限 120s），稳定运行 10 分钟后重置；CC Switch 只负责「没运行就打开」，不强制重启。
+
+---
+
+## Plugins
+
+把 `.py` 文件放进 `plugins/` 目录即可扩展功能，启动时自动加载（`_` 开头的文件跳过）。参考实现见 `plugins/example.py`。
+
+```python
+# plugins/my_plugin.py
+from plugins import Plugin, PluginContext
+
+class MyPlugin(Plugin):
+    name = "my"
+    description = "我的插件"
+    commands = {"/hi": "/hi - 打招呼"}
+
+    def handle_command(self, cmd, args, ctx):
+        return f"你好！{args}"
+
+    def on_message(self, text, ctx):
+        # 返回 str 则直接回复并拦截；返回 None 继续走 AI
+        return None
+
+    def on_response(self, text, response, ctx):
+        # 改写 AI 回复后再发给用户
+        return response
+```
+
+| 钩子 | 时机 | 返回值 |
+|------|------|--------|
+| `on_start` / `on_stop` | bridge 启动 / 退出 | — |
+| `handle_command(cmd, args, ctx)` | 用户输入命中 `commands` 里注册的斜杠命令（优先于内置命令） | 回复文本或 None |
+| `on_message(text, ctx)` | 消息即将发给 AI 之前 | 回复文本（拦截）或 None |
+| `on_response(text, resp, ctx)` | AI 回复发给用户之前 | 改写后的文本 |
+
+`ctx` 提供 `reply(text)`（回复当前用户）、`send_file(path)`（发文件给当前用户）、`ask_agent(msg)`（调 AI）、`memory`、`scheduler`、`user_id`、`working_dir`。单个插件抛异常不影响 bridge 运行。
+
+微信端命令：`/plugins` 查看已加载插件，`/reload` 热重载。
 
 ---
 

@@ -25,3 +25,6 @@ memory/
 # Environment
 .env
 .venv/
+
+# Daemon logs (incl. rotated files)
+logs/

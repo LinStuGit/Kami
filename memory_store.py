@@ -2,18 +2,32 @@
 
 Stores long-term memories in MEMORY.md and daily conversation logs.
 No vector DB — uses simple keyword matching for retrieval.
+
+Old daily logs follow an Ebbinghaus-style decay: verbatim for a few days,
+then compressed into a one-line MEMORY.md summary (via the local model),
+then forgotten entirely once the summary itself expires.
 """
 
 import logging
+import re
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from llm_local import ask_local
 
 logger = logging.getLogger(__name__)
 
 MEMORY_DIR = Path.home() / ".config" / "wechat-claude-bridge" / "memory"
 MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
 _lock = threading.Lock()
+
+# Forgetting-curve retention tiers.
+KEEP_RAW_DAYS = 3       # verbatim logs kept this long (matches /search window)
+SUMMARY_TTL_DAYS = 30   # compressed summaries live this long, then are dropped
+CHECK_INTERVAL_S = 6 * 3600  # consolidation pass cadence
+_SUMMARY_RE = re.compile(r"^- \[dialog\] (\d{4}-\d{2}-\d{2})")
 
 
 def _ensure_dir() -> None:
@@ -191,3 +205,99 @@ class MemoryStore:
             return f"No results for '{query}'."
 
         return f"Search results for '{query}':\n" + "\n".join(results[:20])
+
+    # ── Forgetting-curve maintenance ────────────────────────────
+
+    def start_maintenance(self) -> None:
+        """Start the background consolidation loop (runs once at boot)."""
+        threading.Thread(target=self._maintenance_loop, daemon=True).start()
+
+    def _maintenance_loop(self) -> None:
+        while True:
+            try:
+                self.consolidate()
+            except Exception as e:
+                logger.error("Memory consolidation failed: %s", e)
+            time.sleep(CHECK_INTERVAL_S)
+
+    def consolidate(self) -> None:
+        """One forgetting-curve pass.
+
+        Daily logs older than KEEP_RAW_DAYS are compressed into a single
+        [dialog] line in MEMORY.md and the raw file removed; [dialog]
+        summaries older than SUMMARY_TTL_DAYS are deleted outright.
+        """
+        _ensure_dir()
+        cutoff = datetime.now() - timedelta(days=KEEP_RAW_DAYS)
+        for path in sorted(MEMORY_DIR.glob("*.md")):
+            if path == MEMORY_FILE:
+                continue
+            try:
+                day = datetime.strptime(path.stem, "%Y-%m-%d")
+            except ValueError:
+                continue  # not a daily log
+            if day >= cutoff:
+                continue
+            summary = self._summarize_log(path, day)
+            if summary:
+                self._append_summary(day, summary)
+            path.unlink()
+            logger.info("Consolidated %s into memory summary", path.name)
+        self._prune_summaries()
+
+    def _summarize_log(self, path: Path, day: datetime) -> str:
+        """Compress one daily log to a summary line; extractive fallback."""
+        turns: list[str] = []
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("**User:**"):
+                turns.append("用户: " + line[len("**User:**"):].strip())
+            elif line.startswith("**Bot:**"):
+                turns.append("助手: " + line[len("**Bot:**"):].strip())
+        transcript = "\n".join(turns)[:6000]
+        if not transcript:
+            return ""
+
+        date_str = day.strftime("%Y-%m-%d")
+        summary = ask_local(
+            f"以下是 {date_str} 一天的对话记录。请压缩成一段要点摘要（150字以内），"
+            f"保留事实、决定、偏好和未完成事项，忽略寒暄。直接输出摘要正文：\n\n{transcript}",
+            system="你是记忆压缩器。只输出摘要正文，不要评论。",
+            max_tokens=300,
+        )
+        if not summary:
+            # Local model down — keep the user's own words as the summary.
+            user_lines = [t[4:] for t in turns if t.startswith("用户: ")]
+            summary = "要点：" + "；".join(user_lines)
+        return summary.replace("\n", " ").strip()[:400]
+
+    def _append_summary(self, day: datetime, summary: str) -> None:
+        entry = f"- [dialog] {day.strftime('%Y-%m-%d')} 对话摘要：{summary}\n"
+        with _lock:
+            existing = ""
+            if MEMORY_FILE.exists():
+                existing = MEMORY_FILE.read_text()
+            if not existing.startswith("# Memory"):
+                existing = "# Memory\n\n" + existing
+            MEMORY_FILE.write_text(existing.rstrip("\n") + "\n" + entry)
+
+    def _prune_summaries(self) -> None:
+        """Drop [dialog] summaries that have outlived SUMMARY_TTL_DAYS."""
+        ttl = datetime.now() - timedelta(days=SUMMARY_TTL_DAYS)
+        with _lock:
+            if not MEMORY_FILE.exists():
+                return
+            kept, dropped = [], 0
+            for line in MEMORY_FILE.read_text().splitlines(keepends=True):
+                m = _SUMMARY_RE.match(line)
+                if m:
+                    try:
+                        if datetime.strptime(m.group(1), "%Y-%m-%d") < ttl:
+                            dropped += 1
+                            continue
+                    except ValueError:
+                        pass
+                kept.append(line)
+            if dropped:
+                MEMORY_FILE.write_text("".join(kept))
+                logger.info("Forgot %d expired dialog summaries", dropped)

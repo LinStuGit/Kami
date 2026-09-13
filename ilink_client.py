@@ -6,6 +6,7 @@ No OpenClaw dependency — talks directly to the iLink relay.
 """
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import stat
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -22,11 +23,19 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 logger = logging.getLogger(__name__)
 
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
+CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 CHANNEL_VERSION = "1.0.2"
 CONFIG_DIR = Path.home() / ".config" / "wechat-claude-bridge"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 CURSOR_FILE = CONFIG_DIR / "cursor.dat"
 POLL_TIMEOUT_S = 40  # slightly above server's 35s hold
+MAX_MEDIA_SEND_SIZE = 100 * 1024 * 1024  # 100 MB sanity cap for uploads
+
+# UploadMediaType (proto enum values used by getuploadurl)
+MEDIA_TYPE_IMAGE = 1
+MEDIA_TYPE_VIDEO = 2
+MEDIA_TYPE_FILE = 3
+MEDIA_TYPE_VOICE = 4
 
 
 def _random_uin() -> str:
@@ -343,6 +352,186 @@ class ILinkClient:
                 return False
         return True
 
+    # -- Media Upload / Send ---------------------------------------------------
+
+    @staticmethod
+    def _aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
+        """AES-128-ECB encrypt with PKCS7 padding (WeChat CDN convention)."""
+        pad = 16 - (len(data) % 16)
+        padded = data + bytes([pad]) * pad
+        cipher = Cipher(algorithms.AES(key), modes.ECB())
+        encryptor = cipher.encryptor()
+        return encryptor.update(padded) + encryptor.finalize()
+
+    def upload_media(self, to_user_id: str, path: Path, media_type: int) -> tuple[str, bytes]:
+        """Upload a local file to the WeChat CDN (AES-128-ECB encrypted).
+
+        Returns (encrypt_query_param, aeskey) for building the message item.
+        """
+        raw = path.read_bytes()
+        rawsize = len(raw)
+        if rawsize == 0:
+            raise ValueError(f"Cannot send empty file: {path}")
+        if rawsize > MAX_MEDIA_SEND_SIZE:
+            raise ValueError(
+                f"File too large ({rawsize} bytes, limit {MAX_MEDIA_SEND_SIZE})"
+            )
+        filesize = ((rawsize + 1) + 15) // 16 * 16  # PKCS7 padded size
+        aeskey = os.urandom(16)
+        filekey = os.urandom(16).hex()
+        rawfilemd5 = hashlib.md5(raw).hexdigest()
+
+        resp = self._client.post(
+            f"{self.base_url}/ilink/bot/getuploadurl",
+            headers=self._headers(),
+            json={
+                "filekey": filekey,
+                "media_type": media_type,
+                "to_user_id": to_user_id,
+                "rawsize": rawsize,
+                "rawfilemd5": rawfilemd5,
+                "filesize": filesize,
+                "no_need_thumb": True,
+                "aeskey": aeskey.hex(),
+                "base_info": {"channel_version": CHANNEL_VERSION},
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        ret = data.get("ret")
+        if ret is not None and ret != 0:
+            raise RuntimeError(f"getuploadurl ret={ret}: {data.get('errmsg', '')}")
+
+        upload_url = (data.get("upload_full_url") or "").strip()
+        if not upload_url:
+            upload_param = data.get("upload_param", "")
+            if not upload_param:
+                raise RuntimeError("getuploadurl returned no upload URL")
+            upload_url = (
+                f"{CDN_BASE_URL}/upload"
+                f"?encrypted_query_param={quote(upload_param)}&filekey={quote(filekey)}"
+            )
+
+        ciphertext = self._aes_ecb_encrypt(raw, aeskey)
+        up = self._client.post(
+            upload_url,
+            content=ciphertext,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=300,
+        )
+        if up.status_code != 200:
+            err = up.headers.get("x-error-message", up.text[:200])
+            raise RuntimeError(f"CDN upload failed ({up.status_code}): {err}")
+        param = up.headers.get("x-encrypted-param")
+        if not param:
+            raise RuntimeError("CDN upload response missing x-encrypted-param")
+        logger.info("Uploaded %s (%d bytes) to CDN", path.name, rawsize)
+        return param, aeskey
+
+    def _send_media_item(
+        self,
+        to_user_id: str,
+        context_token: str,
+        item: dict,
+    ) -> bool:
+        client_id = f"wechat-claude-bridge:{uuid.uuid4().hex[:16]}"
+        payload = {
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": to_user_id,
+                "client_id": client_id,
+                "message_type": 2,
+                "message_state": 2,
+                "context_token": context_token,
+                "item_list": [item],
+            },
+            "base_info": {"channel_version": CHANNEL_VERSION},
+        }
+        resp = self._client.post(
+            f"{self.base_url}/ilink/bot/sendmessage",
+            headers=self._headers(),
+            json=payload,
+        )
+        try:
+            resp_data = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            logger.error("Non-JSON response from sendmessage: %d", resp.status_code)
+            return False
+        ret = resp_data.get("ret")
+        if resp.status_code != 200 or (ret is not None and ret != 0):
+            logger.error(
+                "Failed to send media: ret=%s, errmsg=%s",
+                ret,
+                resp_data.get("errmsg", resp.text[:200]),
+            )
+            return False
+        return True
+
+    def send_file(
+        self,
+        to_user_id: str,
+        context_token: str,
+        path: Path,
+        caption: str = "",
+    ) -> bool:
+        """Send a local file as a WeChat file message."""
+        path = Path(path)
+        if not path.is_file():
+            logger.error("send_file: not a file: %s", path)
+            return False
+        try:
+            param, aeskey = self.upload_media(to_user_id, path, MEDIA_TYPE_FILE)
+        except Exception as e:
+            logger.error("send_file upload failed: %s", e)
+            return False
+        if caption:
+            self.send_text(to_user_id, context_token, caption)
+        item = {
+            "type": 4,
+            "file_item": {
+                "media": {
+                    "encrypt_query_param": param,
+                    "aes_key": base64.b64encode(aeskey).decode(),
+                    "encrypt_type": 1,
+                },
+                "file_name": path.name,
+                "len": str(path.stat().st_size),
+            },
+        }
+        return self._send_media_item(to_user_id, context_token, item)
+
+    def send_image(
+        self,
+        to_user_id: str,
+        context_token: str,
+        path: Path,
+        caption: str = "",
+    ) -> bool:
+        """Send a local image as a WeChat image message."""
+        path = Path(path)
+        if not path.is_file():
+            logger.error("send_image: not a file: %s", path)
+            return False
+        try:
+            param, aeskey = self.upload_media(to_user_id, path, MEDIA_TYPE_IMAGE)
+        except Exception as e:
+            logger.error("send_image upload failed: %s", e)
+            return False
+        if caption:
+            self.send_text(to_user_id, context_token, caption)
+        item = {
+            "type": 2,
+            "image_item": {
+                "media": {
+                    "encrypt_query_param": param,
+                    "aes_key": base64.b64encode(aeskey).decode(),
+                    "encrypt_type": 1,
+                },
+                "mid_size": ((path.stat().st_size + 1) + 15) // 16 * 16,
+            },
+        }
+        return self._send_media_item(to_user_id, context_token, item)
+
     def send_typing(self, to_user_id: str, context_token: str) -> None:
         """Send typing indicator to show bot is processing."""
         try:
@@ -442,12 +631,18 @@ class ILinkClient:
                 )
             elif item_type == 4:  # File
                 file_item = item.get("file_item", {})
+                f_media = file_item.get("media", {})
                 media.append(
                     {
                         "type": "file",
-                        "cdn_url": file_item.get("cdn_url", ""),
-                        "aes_key": file_item.get("aes_key", ""),
+                        # Inbound file_item carries media.encrypt_query_param /
+                        # media.aes_key / media.full_url — same shape as images.
+                        "cdn_url": f_media.get("full_url", file_item.get("cdn_url", "")),
+                        "aes_key": f_media.get("aes_key", ""),
+                        "encrypt_query_param": f_media.get("encrypt_query_param", ""),
                         "filename": file_item.get("file_name", "unknown"),
+                        "size": int(file_item.get("len", "0") or 0),
+                        "md5": file_item.get("md5", ""),
                     }
                 )
         return media

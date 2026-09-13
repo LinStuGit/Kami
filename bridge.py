@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -25,7 +26,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ilink_client import ILinkClient
+from llm_local import ask_local, is_local_up
 from memory_store import MemoryStore
+from plugins import PluginManager
 from scheduler import Scheduler
 
 logging.basicConfig(
@@ -34,11 +37,20 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # poll spam floods the daemon log
 
 CONFIG_DIR = Path.home() / ".config" / "wechat-claude-bridge"
 SESSION_FILE = CONFIG_DIR / "sessions.json"
 MEDIA_DIR = CONFIG_DIR / "media"
 PERSONA_FILE = CONFIG_DIR / "persona.json"
+MODES_FILE = CONFIG_DIR / "modes.json"
+
+# The bridge runs console-less (pythonw under the daemon); console children
+# like claude.exe would each pop up a NEW console window without this flag.
+_SILENT = {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
+
+# Marker the agent can emit to deliver files to the user: [[file: /path]]
+FILE_MARKER_RE = re.compile(r"\[\[file:\s*(.+?)\s*\]\]")
 
 # Per-user state
 _sessions: dict[str, str] = {}  # user_id -> session_id
@@ -54,7 +66,68 @@ _executor = ThreadPoolExecutor(max_workers=8)
 # OpenClaw-inspired subsystems
 _memory = MemoryStore()
 _scheduler = Scheduler()
+_plugins = PluginManager()
 _personas: dict[str, str] = {}  # user_id -> persona string
+_user_modes: dict[str, str] = {}  # user_id -> auto | fast | pro
+
+
+def _load_modes() -> None:
+    try:
+        _user_modes.update(json.loads(MODES_FILE.read_text()))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+
+def _save_modes() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    MODES_FILE.write_text(json.dumps(_user_modes, indent=2))
+
+
+def _looks_simple(text: str) -> bool:
+    """Heuristic: True = short/casual query fit for the local fast model.
+
+    Conservative by design — anything ambiguous routes to Claude.
+    """
+    t = text.strip()
+    if not t or len(t) > 120 or "\n" in t or "```" in t or "http" in t:
+        return False
+    low = t.lower()
+    # Big-task markers always go to Claude
+    heavy = (
+        "写", "生成", "实现", "修复", "修一下", "调试", "分析", "重构", "开发",
+        "创建", "搭建", "部署", "脚本", "代码", "程序", "论文", "报告", "文档",
+        "项目", "读取", "发给我", "文件", "debug", "refactor", "implement",
+        "build", "fix", "create", "generate", "write a", "code",
+    )
+    if any(k in low for k in heavy):
+        return False
+    simple = (
+        "你好", "您好", "hi", "hello", "在吗", "谢谢", "感谢", "thanks",
+        "你是谁", "几点", "今天星期", "天气", "翻译", "什么意思", "为什么",
+        "是什么", "怎么读", "多少", "晚安", "早上好", "下午好", "再见",
+        "help", "/",
+    )
+    if any(k in low for k in simple):
+        return True
+    # Short pure question
+    if len(t) <= 40 and (t.endswith("?") or t.endswith("？")):
+        return True
+    return False
+
+
+def call_local(message: str, user_id: str) -> str | None:
+    """Fast reply from the local llama.cpp model. None = unavailable."""
+    # Same context Claude gets: persona + shared MEMORY.md block, so both
+    # paths answer from the same memory.
+    parts = []
+    persona = _personas.get(user_id, "")
+    if persona:
+        parts.append(f"Persona: {persona}")
+    mem_ctx = _memory.get_context()
+    if mem_ctx:
+        parts.append(mem_ctx)
+    system = "\n".join(parts) if parts else None
+    return ask_local(message, system=system)
 
 
 def _load_personas() -> None:
@@ -107,9 +180,37 @@ AGENTS: dict[str, dict] = {
 }
 
 
+# Tools Claude may use without an approval prompt. Headless (-p) runs have no
+# permission-prompt channel, so unlisted tools are auto-denied — which is why
+# the session reported "no file read / command execution tools". Scoped
+# allowlist instead of --dangerously-skip-permissions: only these are granted.
+AGENT_ALLOWED_TOOLS = ",".join(
+    [
+        "Read",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "NotebookEdit",
+        "Bash",
+        "Task",
+        "TodoWrite",
+        "WebFetch",
+        "WebSearch",
+    ]
+)
+
+
 def _build_claude_cmd(message: str, session_id: str | None) -> list[str]:
     """Build Claude Code CLI command."""
-    cmd = ["claude", "-p", "--output-format", "json"]
+    cmd = [
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        "--allowedTools",
+        AGENT_ALLOWED_TOOLS,
+    ]
     if session_id:
         cmd.extend(["--resume", session_id])
     return cmd
@@ -119,8 +220,67 @@ def _get_user_agent(user_id: str) -> str:
     return _user_agent.get(user_id, "claude")
 
 
+# ── Binary Resolution ───────────────────────────────────────────
+
+# The VS Code extension dir name embeds a version that changes on
+# auto-update, e.g. anthropic.claude-code-2.1.270-win32-x64 — match
+# the prefix and pick the highest version.
+_CLAUDE_EXT_RE = re.compile(
+    r"^anthropic\.claude-code-(\d+(?:\.\d+)*)-", re.IGNORECASE
+)
+_CLAUDE_EXT_CACHE_TTL = 60  # seconds; short so auto-updates are picked up
+_claude_ext_cache: tuple[float, str | None] | None = None
+
+
+def _pick_claude_from_roots(roots: list[Path]) -> str | None:
+    """Scan extension roots for the newest bundled claude binary."""
+    exe_name = "claude.exe" if os.name == "nt" else "claude"
+    best: tuple[tuple[int, ...], Path] | None = None
+    for ext_root in roots:
+        if not ext_root.is_dir():
+            continue
+        for entry in ext_root.iterdir():
+            m = _CLAUDE_EXT_RE.match(entry.name)
+            if not m or not entry.is_dir():
+                continue
+            exe = entry / "resources" / "native-binary" / exe_name
+            if not exe.is_file():
+                continue
+            version = tuple(int(p) for p in m.group(1).split("."))
+            if best is None or version > best[0]:
+                best = (version, exe)
+    return str(best[1]) if best else None
+
+
+def _find_vscode_claude() -> str | None:
+    """Locate the VS Code extension's native claude binary (with TTL cache)."""
+    global _claude_ext_cache
+    now = time.monotonic()
+    if _claude_ext_cache and now - _claude_ext_cache[0] < _CLAUDE_EXT_CACHE_TTL:
+        cached = _claude_ext_cache[1]
+        # Drop the cache early if the extension updated and the dir is gone.
+        if cached is None or Path(cached).is_file():
+            return cached
+        _claude_ext_cache = None
+
+    roots = [
+        Path.home() / ".vscode" / "extensions",
+        Path.home() / ".vscode-insiders" / "extensions",
+    ]
+    result = _pick_claude_from_roots(roots)
+    _claude_ext_cache = (now, result)
+    if result:
+        logger.info("Using VS Code claude binary: %s", result)
+    return result
+
+
 def _find_binary(name: str) -> str | None:
-    """Check if a CLI binary exists on PATH."""
+    """Resolve a CLI binary: prefer the VS Code bundled claude (native exe,
+    auto-updated), fall back to PATH."""
+    if name == "claude":
+        vscode = _find_vscode_claude()
+        if vscode:
+            return vscode
     return shutil.which(name)
 
 
@@ -234,6 +394,7 @@ def call_agent(
     user_id: str,
     working_dir: str | None = None,
     image_paths: list[Path] | None = None,
+    file_paths: list[Path] | None = None,
 ) -> str:
     """Call the user's selected AI agent CLI and return the response."""
     agent_key = _get_user_agent(user_id)
@@ -251,7 +412,7 @@ def call_agent(
     if agent_key == "claude":
         logger.info("Claude session: %s", session_id[:12] if session_id else "new")
 
-    # Append image instructions for Claude to read the files
+    # Append media instructions so Claude knows what arrived
     if image_paths:
         paths_str = ", ".join(str(p) for p in image_paths)
         img_note = (
@@ -260,12 +421,19 @@ def call_agent(
             f"Describe what you see and respond to the user's message."
         )
         message += img_note
+    if file_paths:
+        files_str = "\n".join(f"  - {p.name}: {p}" for p in file_paths)
+        file_note = (
+            f"\n\nThe user sent {len(file_paths)} file(s):\n{files_str}\n"
+            f"Use the Read tool (or Bash) to inspect them and respond accordingly."
+        )
+        message += file_note
 
     cmd = agent["build_cmd"](message, session_id)
     # Replace binary name with full path
     cmd[0] = binary
 
-    # Build system prompt with memory + persona
+    # Build system prompt with memory + persona + file protocol
     if agent_key == "claude":
         sys_parts = []
         persona = _personas.get(user_id, "")
@@ -274,6 +442,11 @@ def call_agent(
         mem_ctx = _memory.get_context()
         if mem_ctx:
             sys_parts.append(mem_ctx)
+        sys_parts.append(
+            "To deliver a file to the user, save it anywhere on disk and include "
+            "[[file: /absolute/path]] in your reply. The bridge sends it via WeChat "
+            "and strips the marker. Multiple files = multiple markers."
+        )
         if sys_parts:
             cmd.extend(["--append-system-prompt", "\n".join(sys_parts)])
 
@@ -290,6 +463,7 @@ def call_agent(
             text=True,
             timeout=1800,
             cwd=working_dir,
+            **_SILENT,
         )
 
         if result.returncode != 0:
@@ -323,6 +497,7 @@ def call_agent(
                     text=True,
                     timeout=1800,
                     cwd=working_dir,
+                    **_SILENT,
                 )
 
             if result.returncode != 0:
@@ -342,10 +517,13 @@ def call_agent(
 # ── Image Handling ──────────────────────────────────────────────
 
 
-def _handle_images(client: ILinkClient, message: dict) -> list[Path]:
-    """Download images from message, return list of saved file paths."""
+def _handle_media(
+    client: ILinkClient, message: dict
+) -> tuple[list[Path], list[Path]]:
+    """Download images/files from message. Returns (image_paths, file_paths)."""
     media_items = client.extract_media(message)
-    saved: list[Path] = []
+    images: list[Path] = []
+    files: list[Path] = []
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
     for item in media_items:
@@ -360,21 +538,74 @@ def _handle_images(client: ILinkClient, message: dict) -> list[Path]:
                 path,
                 encrypt_query_param=item.get("encrypt_query_param", ""),
             ):
-                saved.append(path)
+                images.append(path)
                 logger.info(
                     "Downloaded image: %s (%d bytes)", path.name, path.stat().st_size
                 )
-        elif item["type"] == "file" and item.get("cdn_url"):
+        elif item["type"] == "file" and (
+            item.get("cdn_url") or item.get("encrypt_query_param")
+        ):
             raw_name = item.get("filename", f"file_{int(time.time())}")
             safe_name = Path(raw_name).name  # strip path components
             if not safe_name or safe_name.startswith("."):
                 safe_name = f"file_{int(time.time() * 1000)}"
             path = MEDIA_DIR / safe_name
-            if client.download_media(item["cdn_url"], item.get("aes_key", ""), path):
-                saved.append(path)
-                logger.info("Downloaded file: %s", path.name)
+            # Avoid clobbering an earlier file with the same name
+            if path.exists():
+                path = path.with_stem(f"{path.stem}_{uuid.uuid4().hex[:6]}")
+            if client.download_media(
+                item.get("cdn_url", ""),
+                item.get("aes_key", ""),
+                path,
+                encrypt_query_param=item.get("encrypt_query_param", ""),
+            ):
+                expected_md5 = item.get("md5", "")
+                if expected_md5:
+                    actual = hashlib.md5(path.read_bytes()).hexdigest()
+                    if actual != expected_md5:
+                        logger.warning(
+                            "File md5 mismatch for %s (got %s, want %s)",
+                            path.name,
+                            actual,
+                            expected_md5,
+                        )
+                files.append(path)
+                logger.info(
+                    "Downloaded file: %s (%d bytes)",
+                    path.name,
+                    path.stat().st_size,
+                )
 
-    return saved
+    return images, files
+
+
+def _deliver_files(
+    client: ILinkClient,
+    from_user: str,
+    context_token: str,
+    response: str,
+) -> str:
+    """Send every [[file: path]] the agent emitted; return cleaned text."""
+    sent: list[str] = []
+    missing: list[str] = []
+
+    def _replace(match: re.Match) -> str:
+        raw = match.group(1).strip().strip("'\"")
+        path = Path(raw).expanduser()
+        if path.is_file():
+            if client.send_file(from_user, context_token, path):
+                sent.append(path.name)
+                return ""
+            return f"[file failed: {path.name}]"
+        missing.append(raw)
+        return f"[file not found: {raw}]"
+
+    cleaned = FILE_MARKER_RE.sub(_replace, response)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    if sent:
+        logger.info("Delivered %d file(s) to %s", len(sent), from_user[:16])
+    return cleaned
 
 
 # ── Session Management ──────────────────────────────────────────
@@ -392,6 +623,7 @@ def list_claude_sessions(working_dir: str | None = None) -> str:
             text=True,
             timeout=10,
             cwd=working_dir,
+            **_SILENT,
         )
         if result.returncode != 0:
             return "[Failed to list sessions]"
@@ -424,6 +656,7 @@ def pick_session(choice: str, user_id: str, working_dir: str | None = None) -> s
             text=True,
             timeout=10,
             cwd=working_dir,
+            **_SILENT,
         )
         sessions = json.loads(result.stdout) if result.stdout.strip() else []
     except Exception:
@@ -472,10 +705,11 @@ def handle_message(
 
         # Download images/files (best-effort)
         image_paths: list[Path] = []
+        file_paths: list[Path] = []
         try:
-            image_paths = _handle_images(client, msg)
+            image_paths, file_paths = _handle_media(client, msg)
         except Exception as e:
-            logger.warning("Image download failed: %s", e)
+            logger.warning("Media download failed: %s", e)
 
         # Handle voice messages
         try:
@@ -485,7 +719,7 @@ def handle_message(
         except Exception as e:
             logger.warning("Voice extraction failed: %s", e)
 
-        if not text.strip() and not image_paths:
+        if not text.strip() and not image_paths and not file_paths:
             return
 
         # Debug: log raw item_list types
@@ -499,10 +733,11 @@ def handle_message(
             )
 
         logger.info(
-            "Message from %s (%d chars, %d images)",
+            "Message from %s (%d chars, %d images, %d files)",
             from_user[:16],
             len(text),
             len(image_paths),
+            len(file_paths),
         )
 
         cmd = text.strip()
@@ -510,6 +745,14 @@ def handle_message(
 
         with _workdir_lock:
             working_dir = _working_dir
+
+        ctx = _plugins._make_ctx(from_user, context_token, working_dir)
+
+        # ── Plugin commands (may override built-ins) ──
+        plugin_reply = _plugins.dispatch_command(cmd, ctx)
+        if plugin_reply is not None:
+            client.send_text(from_user, context_token, plugin_reply)
+            return
 
         # ── Special commands ──
         if cmd_lower in ("/reset", "/clear"):
@@ -523,10 +766,13 @@ def handle_message(
             with _sessions_lock:
                 sid = _sessions.get(from_user, "")[:8] or "none"
             agent_name = AGENTS.get(_get_user_agent(from_user), {}).get("name", "?")
+            mode = _user_modes.get(from_user, "auto")
             client.send_text(
                 from_user,
                 context_token,
-                f"Bridge: running\nAgent: {agent_name}\nSession: {sid}\nWorking dir: {working_dir or '(default)'}",
+                f"Bridge: running\nAgent: {agent_name}\nSession: {sid}\n"
+                f"Mode: {mode} (local model: {'up' if is_local_up() else 'down'})\n"
+                f"Working dir: {working_dir or '(default)'}",
             )
             return
 
@@ -633,6 +879,37 @@ def handle_message(
             return
 
         # ── Persona commands ──
+        if cmd_lower == "/mode":
+            m = _user_modes.get(from_user, "auto")
+            local_ok = is_local_up()
+            mode_desc = {
+                "auto": "auto (simple→local, complex→Claude)",
+                "fast": "fast (always local model)",
+                "pro": "pro (always Claude)",
+            }[m]
+            client.send_text(
+                from_user,
+                context_token,
+                f"Mode: {mode_desc}\nLocal model: {'up' if local_ok else 'down'}\n"
+                "Switch: /mode auto | fast | pro\n"
+                "Prefix a message with ! to force Claude once.",
+            )
+            return
+
+        if cmd_lower.startswith("/mode "):
+            m = cmd[6:].strip().lower()
+            if m in ("auto", "fast", "pro"):
+                _user_modes[from_user] = m
+                _save_modes()
+                client.send_text(from_user, context_token, f"Mode set: {m}")
+            else:
+                client.send_text(
+                    from_user,
+                    context_token,
+                    "Usage: /mode auto | fast | pro",
+                )
+            return
+
         if cmd_lower == "/persona":
             p = _personas.get(from_user, "")
             client.send_text(
@@ -719,6 +996,59 @@ def handle_message(
             )
             return
 
+        if cmd_lower.startswith("/send "):
+            raw = cmd[6:].strip().strip("'\"")
+            path = Path(raw).expanduser()
+            if not path.is_file():
+                client.send_text(
+                    from_user, context_token, f"File not found: {path}"
+                )
+                return
+            stop_typing = threading.Event()
+            stop_typing.set()
+            if client.send_file(
+                from_user, context_token, path, caption=f"[Sent] {path.name}"
+            ):
+                logger.info("Sent %s to %s", path.name, from_user[:16])
+            else:
+                client.send_text(
+                    from_user,
+                    context_token,
+                    f"[Failed to send {path.name} — check bridge logs]",
+                )
+            return
+
+        if cmd_lower == "/files":
+            MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            entries = sorted(
+                MEDIA_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
+            )[:10]
+            if not entries:
+                client.send_text(
+                    from_user, context_token, "No files received yet."
+                )
+                return
+            lines = ["Recent files (newest first):\n"]
+            for p in entries:
+                size_kb = p.stat().st_size / 1024
+                age = time.strftime("%m-%d %H:%M", time.localtime(p.stat().st_mtime))
+                lines.append(f"  [{age}] {p.name} ({size_kb:.0f} KB)")
+            lines.append("\nTell Claude to process these, or /send <path>")
+            client.send_text(from_user, context_token, "\n".join(lines))
+            return
+
+        if cmd_lower == "/plugins":
+            client.send_text(from_user, context_token, _plugins.list_plugins())
+            return
+
+        if cmd_lower == "/reload":
+            client.send_text(
+                from_user,
+                context_token,
+                f"Reloaded {_plugins.reload()} plugin(s).",
+            )
+            return
+
         if cmd_lower == "/help":
             client.send_text(
                 from_user,
@@ -732,17 +1062,47 @@ def handle_message(
                 "  /memory /search <q> /log\n"
                 "Persona:\n"
                 "  /persona /persona <desc>\n"
+                "Mode:\n"
+                "  /mode auto|fast|pro  (!msg = force Claude)\n"
+                "Files:\n"
+                "  /send <path> /files\n"
                 "Schedule:\n"
                 "  /remind <time> <msg>\n"
                 "  /every <interval> <msg>\n"
                 "  /cron <expr> <msg>\n"
                 "  /jobs /cancel <id>\n"
+                "Plugins:\n"
+                "  /plugins /reload\n"
                 "Other:\n"
                 "  /status /help\n"
                 "\nPrefix msg with ! in /every /cron to run through Claude.\n"
                 "Anything else is sent to the current agent.",
             )
             return
+
+        # ── Plugin message hook (short-circuit before the agent) ──
+        plugin_reply = _plugins.dispatch_message(text, ctx)
+        if plugin_reply is not None:
+            client.send_text(from_user, context_token, plugin_reply)
+            logger.info("Plugin replied to %s", from_user[:16])
+            return
+
+        # ── Routing: local fast model vs Claude ──
+        force_claude = text.startswith("!")
+        if force_claude:
+            text = text[1:].lstrip()
+            if not text:
+                return
+        mode = _user_modes.get(from_user, "auto")
+        use_local = not force_claude and (
+            mode == "fast" or (mode == "auto" and _looks_simple(text))
+        )
+        logger.info(
+            "Routing %s -> %s (mode=%s)",
+            from_user[:16],
+            "local" if use_local else "claude",
+            mode,
+        )
 
         # ── Forward to AI agent ──
         stop_typing = threading.Event()
@@ -754,8 +1114,22 @@ def handle_message(
         typing_thread.start()
 
         try:
-            response = call_agent(text, from_user, working_dir, image_paths)
-            response = md_to_plain(response)
+            if use_local:
+                response = call_local(text, from_user)
+                if response is not None:
+                    response = _plugins.transform_response(text, response, ctx)
+            else:
+                response = None
+            if response is None:
+                # Pro mode, forced !, complex task, or local model down
+                response = call_agent(
+                    text, from_user, working_dir, image_paths, file_paths
+                )
+                response = _plugins.transform_response(text, response, ctx)
+                response = md_to_plain(response)
+            else:
+                response = md_to_plain(response)
+            response = _deliver_files(client, from_user, context_token, response)
         finally:
             stop_typing.set()
             typing_thread.join(timeout=1)
@@ -795,6 +1169,7 @@ def run_bridge(working_dir: str | None = None) -> None:
 
     _load_sessions()
     _load_personas()
+    _load_modes()
 
     # Scheduler callback: send message (and optionally run Claude) when job fires
     def _on_job_fire(user_id: str, message: str, run_claude: bool) -> None:
@@ -815,11 +1190,25 @@ def run_bridge(working_dir: str | None = None) -> None:
     _scheduler.set_callback(_on_job_fire)
     _scheduler.start()
 
+    # Ebbinghaus-style memory consolidation (old logs -> summaries -> gone)
+    _memory.start_maintenance()
+
+    # Wire plugin system to bridge capabilities, then load plugins/
+    _plugins.bind(
+        send_text=lambda u, c, t: client.send_text(u, c, t),
+        send_file_fn=lambda u, c, p: client.send_file(u, c, Path(p)),
+        call_agent=call_agent,
+        memory=_memory,
+        scheduler=_scheduler,
+    )
+    plugin_count = _plugins.load()
+
     print("\n=== WeChat-Claude Code Bridge ===")
     print(f"Working directory: {working_dir or '(default)'}")
     print(f"Default agent: {AGENTS['claude']['name']}")
     print(f"Memory: {_memory.get_context()[:30] or '(empty)'}...")
     print(f"Scheduled jobs: {len(_scheduler._jobs)}")
+    print(f"Plugins: {_plugins.count}")
     print("Listening for WeChat messages... (Ctrl+C to stop)\n")
 
     consecutive_errors = 0
@@ -857,6 +1246,7 @@ def run_bridge(working_dir: str | None = None) -> None:
         print("\nStopping bridge...")
     finally:
         _save_sessions()
+        _plugins.unload()
         _scheduler.stop()
         _executor.shutdown(wait=False)
         client.close()

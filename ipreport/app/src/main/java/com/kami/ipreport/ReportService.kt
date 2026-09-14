@@ -168,7 +168,7 @@ class ReportService : Service() {
         }
     }
 
-    /** First wlan*/ IPv4 across active networks; "" when none. */
+    /** First wlan-prefixed IPv4 across active networks; "" when none. */
     private fun currentWifiIp(): String {
         val mgr = cm ?: return ""
         for (n in mgr.allNetworks) {

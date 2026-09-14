@@ -1,7 +1,7 @@
 package com.kami.ipreport
 
 import android.content.pm.PackageManager
-import dev.rikka.shizuku.Shizuku
+import rikka.shizuku.Shizuku
 
 /** Run privileged (shell-uid) commands through Shizuku; no root needed. */
 object ShizukuRunner {

@@ -8,7 +8,7 @@ import android.os.Bundle
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.widget.Toast
-import dev.rikka.shizuku.Shizuku
+import rikka.shizuku.Shizuku
 import kotlin.concurrent.thread
 import org.json.JSONObject
 

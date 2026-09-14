@@ -15,7 +15,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import dev.rikka.shizuku.Shizuku
+import rikka.shizuku.Shizuku
 
 /**
  * Config screen + switches for the IP reporter. No Termux involved: the

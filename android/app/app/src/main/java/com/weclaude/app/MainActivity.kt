@@ -99,9 +99,13 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun shizukuExec(cmd: String) {
             val output = try {
-                val p = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
+                val service = moe.shizuku.server.IShizukuService.Stub.asInterface(
+                    rikka.shizuku.ShizukuBinderWrapper(Shizuku.getBinder())
+                )
+                val p = service.newProcess(arrayOf("sh", "-c", cmd), null, null)
                 val out = p.inputStream.bufferedReader().readText()
                 val err = p.errorStream.bufferedReader().readText()
+                p.waitFor()
                 (out + err).trim().ifEmpty { "(ok, no output)" }
             } catch (e: Throwable) {
                 "Shizuku error: $e"

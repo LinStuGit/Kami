@@ -1,7 +1,8 @@
 package com.kami.ipreport
 
-import android.content.pm.PackageManager
+import moe.shizuku.server.IShizukuService
 import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuBinderWrapper
 
 /** Run privileged (shell-uid) commands through Shizuku; no root needed. */
 object ShizukuRunner {
@@ -14,9 +15,12 @@ object ShizukuRunner {
         false
     }
 
-    /** Run one shell command; returns combined output ("" when silent). */
+    /** Run one shell command; returns combined output ("" on failure). */
     fun run(cmd: String): String = try {
-        val p = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
+        val service = IShizukuService.Stub.asInterface(
+            ShizukuBinderWrapper(Shizuku.getBinder())
+        )
+        val p = service.newProcess(arrayOf("sh", "-c", cmd), null, null)
         val out = p.inputStream.bufferedReader().readText()
         val err = p.errorStream.bufferedReader().readText()
         p.waitFor()

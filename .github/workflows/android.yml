@@ -1,0 +1,48 @@
+name: android-apk
+
+on:
+  push:
+    branches: [main]
+    paths: ["android/**", "ipreport/**", ".github/workflows/android.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Build debug APK
+        run: gradle assembleDebug -p android/app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kami-debug-apk
+          path: android/app/app/build/outputs/apk/debug/app-debug.apk
+
+  ipreport:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Build reporter APK
+        run: gradle assembleDebug -p ipreport
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kami-ipreport-apk
+          path: ipreport/app/build/outputs/apk/debug/app-debug.apk

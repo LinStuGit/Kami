@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kami 控制台</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d;
+    --fg: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --ok: #3fb950; --bad: #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding-bottom: 76px;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 16px; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; background: var(--bg); z-index: 5;
+  }
+  header h1 { font-size: 17px; font-weight: 600; flex: 1; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); }
+  .dot.ok { background: var(--ok); }
+  #status { font-size: 12px; color: var(--dim); }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 12px 16px; }
+  button {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 6px; font-size: 14px; cursor: pointer;
+  }
+  button:active { background: #21262d; }
+  button.primary { border-color: var(--accent); color: var(--accent); }
+  button.danger { border-color: var(--bad); color: var(--bad); }
+  .card {
+    margin: 0 16px 12px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+  }
+  .card h2 {
+    font-size: 13px; font-weight: 600; color: var(--dim);
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  #term {
+    height: 46vh; overflow-y: auto; padding: 10px 14px;
+    font: 12px/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+    word-break: break-all; color: #c9d1d9;
+  }
+  .row { display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--line); }
+  .row input {
+    flex: 1; background: var(--bg); border: 1px solid var(--line); color: var(--fg);
+    border-radius: 8px; padding: 10px 12px; font: 13px ui-monospace, monospace;
+  }
+  .hint { padding: 0 16px; font-size: 12px; color: var(--dim); }
+  .hidden { display: none; }
+  #toast {
+    position: fixed; left: 50%; bottom: 90px; transform: translateX(-50%);
+    background: #21262d; border: 1px solid var(--line); border-radius: 10px;
+    padding: 8px 16px; font-size: 13px; opacity: 0; transition: opacity .2s; z-index: 9;
+  }
+  #toast.show { opacity: 1; }
+  .navbar {
+    position: fixed; bottom: 0; left: 0; right: 0; display: flex;
+    border-top: 1px solid var(--line); background: var(--panel); z-index: 5;
+  }
+  .navbar button { flex: 1; border: 0; border-radius: 0; padding: 14px 0; font-size: 14px; }
+  .navbar button + button { border-left: 1px solid var(--line); }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Kami</h1>
+  <span id="status">未连接</span>
+</header>
+
+<div id="page-main">
+  <div class="grid">
+    <button class="primary" onclick="act('daemon.start')">启动</button>
+    <button onclick="act('daemon.restart')">重启</button>
+    <button class="danger" onclick="act('daemon.stop')">停止</button>
+    <button onclick="act('daemon.status')">状态</button>
+    <button onclick="act('log.tail')">日志</button>
+    <button onclick="refresh()">刷新</button>
+  </div>
+
+  <div class="card">
+    <h2><span>终端</span><span id="live">—</span></h2>
+    <div id="term">连接中…</div>
+  </div>
+</div>
+
+<div id="page-exec" class="hidden">
+  <div class="card">
+    <h2><span>命令</span></h2>
+    <div class="row">
+      <input id="cmd" placeholder="例如: python bridge.py --help" autocapitalize="off" autocorrect="off">
+    </div>
+    <div class="grid" style="padding: 0 10px 10px">
+      <button onclick="runCmd('claude --version')">claude -v</button>
+      <button onclick="runCmd('node -v && python -V')">环境版本</button>
+      <button onclick="runCmd('termux-wake-lock')">唤醒锁</button>
+      <button onclick="runCmd('termux-wake-unlock')">释放锁</button>
+      <button onclick="runCmd('python control_server.py --help')">控制端帮助</button>
+    </div>
+  </div>
+
+  <div class="card" id="shizuku-card">
+    <h2><span>Shizuku 提权</span><span id="shizuku-state">仅 APK 内可用</span></h2>
+    <div class="grid" style="padding: 0 10px 10px">
+      <button onclick="shizukuAuth()">授权</button>
+      <button onclick="if(window.WeClaudeApp){window.WeClaudeApp.startViaTermux()}else{toast('请使用 Kami APK')}">Termux一键启动</button>
+      <button onclick="shizukuRun('dumpsys deviceidle whitelist +com.termux')">电池优化白名单</button>
+      <button onclick="shizukuRun('cmd appops set com.termux RUN_IN_BACKGROUND allow')">后台运行白名单</button>
+      <button onclick="shizukuRun('am start -n com.tencent.mm/.ui.LauncherUI')">打开微信</button>
+    </div>
+  </div>
+
+  <p class="hint" style="margin-top:8px">
+    命令在本机 shell 执行（等价 Termux 内直接敲），无输出超时 120s。<br>
+    Shizuku 按钮需要安装 Shizuku APP 并已启动服务；在 APK 内使用效果最佳。
+  </p>
+</div>
+
+<div class="navbar">
+  <button onclick="switchTab('main')">主控</button>
+  <button onclick="switchTab('exec')">命令 / Shizuku</button>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const qs = new URLSearchParams(location.search);
+let token = localStorage.getItem('wc_token') || qs.get('t') || '';
+if (qs.get('t')) { localStorage.setItem('wc_token', qs.get('t')); }
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+function appendTerm(line) {
+  const el = document.getElementById('term');
+  el.textContent += line + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+function setLive(ok) {
+  document.getElementById('live').textContent = ok ? '● live' : '—';
+  document.getElementById('dot').classList.toggle('ok', ok);
+}
+
+async function api(path, opts) {
+  const u = new URL(path, location.origin);
+  u.searchParams.set('t', token);
+  const r = await fetch(u, opts);
+  if (r.status === 401) {
+    token = prompt('请输入控制令牌（服务器启动时打印，存于 control_token）') || '';
+    localStorage.setItem('wc_token', token);
+    throw new Error('unauthorized');
+  }
+  return r.json();
+}
+
+async function refresh() {
+  try {
+    const s = await api('/api/status');
+    setLive(s.daemon || s.bridge);
+    const parts = [];
+    parts.push(s.bridge ? '桥接运行中' : '桥接停止');
+    if (s.llama) parts.push('本地模型在线');
+    document.getElementById('status').textContent = parts.join(' · ');
+  } catch (e) { setLive(false); }
+}
+
+async function act(name) {
+  try {
+    const r = await api('/api/action?name=' + encodeURIComponent(name));
+    if (r.out) appendTerm('── ' + name + ' ──\n' + r.out);
+    if (name === 'daemon.status' || name.startsWith('daemon.')) refresh();
+  } catch (e) { toast('失败：' + e.message); }
+}
+
+async function runCmd(cmd) {
+  appendTerm('$ ' + cmd);
+  try {
+    const r = await api('/api/exec', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cmd}),
+    });
+    if (r.out) appendTerm(r.out);
+    appendTerm('[exit ' + r.code + ']');
+  } catch (e) { appendTerm('错误: ' + e.message); }
+}
+
+// ── Shizuku（仅 APK 内可用；注入名 window.WeClaudeApp 为兼容旧 APK 保留）──
+function shizukuAuth() {
+  if (window.WeClaudeApp) window.WeClaudeApp.requestShizuku();
+  else toast('请使用 Kami APK');
+}
+function shizukuRun(cmd) {
+  if (!window.WeClaudeApp) { toast('请使用 Kami APK'); return; }
+  appendTerm('[shizuku] $ ' + cmd);
+  window.WeClaudeApp.shizukuExec(cmd);
+}
+window.__shizukuResult = (out) => { if (out) appendTerm(out); };
+
+function switchTab(name) {
+  document.getElementById('page-main').classList.toggle('hidden', name !== 'main');
+  document.getElementById('page-exec').classList.toggle('hidden', name !== 'exec');
+}
+
+function connectLog() {
+  const es = new EventSource('/api/log/stream?t=' + encodeURIComponent(token));
+  es.onopen = () => setLive(true);
+  es.onmessage = (ev) => {
+    if (ev.data === '── live ──') { setLive(true); return; }
+    appendTerm(ev.data);
+  };
+  es.onerror = () => { setLive(false); es.close(); setTimeout(connectLog, 3000); };
+}
+
+if (window.WeClaudeApp) {
+  document.getElementById('shizuku-state').textContent = 'APK 已连接';
+}
+connectLog();
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

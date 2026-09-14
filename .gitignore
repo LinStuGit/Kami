@@ -28,3 +28,10 @@ memory/
 
 # Daemon logs (incl. rotated files)
 logs/
+
+# Local Claude session files
+.claude/
+
+# Android/Gradle build artifacts
+.gradle/
+local.properties

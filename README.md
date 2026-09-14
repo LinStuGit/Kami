@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">WeClaude</h1>
+  <h1 align="center">Kami</h1>
   <p align="center">
     <strong>微信 ClawBot 直连 Claude Code，无需 OpenClaw</strong>
   </p>
@@ -23,14 +23,14 @@
 
 ---
 
-## Why WeClaude?
+## Why Kami?
 
 你是否想过：**通勤路上用手机让 Claude Code 帮你改 bug？**
 
-WeClaude 用 **~2000 行 Python**，直接把微信 ClawBot 和 Claude Code CLI 连在一起。轻量、安全、开箱即用。
+Kami 用 **~2000 行 Python**，直接把微信 ClawBot 和 Claude Code CLI 连在一起。轻量、安全、开箱即用。
 
 <p align="center">
-  <img src="assets/flow.png" alt="WeClaude 架构流程" width="700">
+  <img src="assets/flow.png" alt="Kami 架构流程" width="700">
 </p>
 
 ### 亮点
@@ -137,6 +137,25 @@ WeClaude 用 **~2000 行 Python**，直接把微信 ClawBot 和 Claude Code CLI 
 本地模型由守护进程托管 `llama-server`（127.0.0.1:8899，OpenAI 兼容接口，GPU 全量 offload）；
 本地不可用时自动回退 Claude。启发式路由偏保守——含任务动词（写/生成/修复/分析…）的消息一律走 Claude。
 
+**视觉路由**：守护进程同时托管 **Qwen3-VL-4B**（127.0.0.1:8188，带 mmproj 投影器）。
+auto/fast 模式下，微信发来的图片自动由本地 VL 模型识别回答（~2s）；图片配文字若含任务动词仍升级 Claude；
+VL 不可用时回退 Claude 读图。`/status` 可查看两个本地模型的健康状态。
+
+### 9. 工单系统 — 先快答、再委派、完成汇报
+
+```
+你：帮我写个爬虫脚本
+[Qwen3.5-2B | 快速应答]            ← 秒回：本地模型先给思路
+已创建工单 T-a1b2，委派给 Claude Code 执行…
+⏳ [Claude Code | T-a1b2] 仍在执行（已 3m00s）   ← 长任务每 3 分钟汇报
+✅ [Claude Code | T-a1b2] 完成（耗时 5m12s）：…   ← 完成回复，署名模型
+```
+
+- 每一条模型回复都标注来源模型（+工单号）；快问直答不建工单
+- `/tickets` 查看进行中的工单，`/cancel T-xxxx` 取消，`/models` 查看已注册模型
+- **注册新模型**：插件里 `ctx.register_model(ModelSpec(key=…, name=…, runner=…))` 即接入路由与工单体系（见 `models.py`）
+- **远程提供商**：`providers.json`（0600）配置 OpenAI 兼容端点（默认 paratera/GLM 全家桶），`models` 映射即白名单——未列出的模型一律拒绝。微信 `/ask glm-4-flash 你好` 直接问指定模型；文生图模型（CogView）的产出会作为文件发回微信
+
 ---
 
 <a id="quick-start"></a>
@@ -152,8 +171,8 @@ WeClaude 用 **~2000 行 Python**，直接把微信 ClawBot 和 Claude Code CLI 
 ### 安装
 
 ```bash
-git clone https://github.com/allenhuang0/WeClaude.git
-cd WeClaude
+git clone https://github.com/allenhuang0/Kami.git
+cd Kami
 pip install -r requirements.txt
 ```
 
@@ -243,7 +262,7 @@ python bridge.py --logout           # 清除登录凭据
 ## Architecture
 
 ```
-WeClaude/
+Kami/
   bridge.py          # 主桥接器：消息路由、Agent 调用、命令分发
   ilink_client.py    # iLink Bot API 客户端：登录、轮询、发送
   memory_store.py    # 持久记忆系统（Markdown 文件存储）
@@ -253,7 +272,7 @@ WeClaude/
 
 ### 数据存储
 
-所有数据存储在本地 `~/.config/wechat-claude-bridge/`，无云端同步：
+所有数据存储在本地 `~/.config/kami/`，无云端同步：
 
 | 文件 | 用途 | 权限 |
 |------|------|------|
@@ -293,10 +312,10 @@ cat > ~/Library/LaunchAgents/com.weclaude.bridge.plist << 'EOF'
     <key>ProgramArguments</key>
     <array>
         <string>python3</string>
-        <string>/path/to/WeClaude/bridge.py</string>
+        <string>/path/to/Kami/bridge.py</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/path/to/WeClaude</string>
+    <string>/path/to/Kami</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -318,13 +337,13 @@ launchctl load ~/Library/LaunchAgents/com.weclaude.bridge.plist
 <details>
 <summary><strong>Q: 和 OpenClaw 有什么区别？</strong></summary>
 
-OpenClaw 是完整的 AI 助手平台（200K+ 行代码），WeClaude 只做一件事：把微信消息转发给 Claude Code。更轻量、更专注、更易审计。
+OpenClaw 是完整的 AI 助手平台（200K+ 行代码），Kami 只做一件事：把微信消息转发给 Claude Code。更轻量、更专注、更易审计。
 </details>
 
 <details>
 <summary><strong>Q: Session 显示 "Ended" 是 bug 吗？</strong></summary>
 
-不是。`claude -p` 模式每次调用后进程退出，session 标记为 Ended。但通过 `--resume`，对话上下文完整保留。WeClaude 自动管理这个过程。
+不是。`claude -p` 模式每次调用后进程退出，session 标记为 Ended。但通过 `--resume`，对话上下文完整保留。Kami 自动管理这个过程。
 </details>
 
 <details>
@@ -405,8 +424,8 @@ class MyPlugin(Plugin):
 欢迎 PR！项目结构简单，~2000 行 Python，容易上手。
 
 ```bash
-git clone https://github.com/allenhuang0/WeClaude.git
-cd WeClaude
+git clone https://github.com/allenhuang0/Kami.git
+cd Kami
 pip install -r requirements.txt
 ruff check .
 python -m py_compile bridge.py
@@ -421,5 +440,5 @@ python -m py_compile bridge.py
 ---
 
 <p align="center">
-  <strong>WeClaude</strong> — 把 Claude Code 装进微信
+  <strong>Kami</strong> — 把 Claude Code 装进微信
 </p>

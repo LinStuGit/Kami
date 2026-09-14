@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plugin system for WeChat-Claude Bridge.
+"""Plugin system for Kami.
 
 Drop a Python file into the ``plugins/`` directory and it is loaded
 automatically at startup (files starting with ``_`` are skipped).
@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+import fmt
+
 logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = Path(__file__).resolve().parent / "plugins"
@@ -53,6 +55,7 @@ class PluginContext:
     call_agent: Callable[..., str]  # (message, user_id, working_dir, image_paths)
     memory: Any  # MemoryStore
     scheduler: Any  # Scheduler
+    register_model_fn: Callable  # models.register_model
     user_id: str
     context_token: str
     working_dir: str | None = None
@@ -64,6 +67,10 @@ class PluginContext:
     def send_file(self, path: str | Path) -> bool:
         """Send a local file to the current user."""
         return self.send_file_fn(self.user_id, self.context_token, Path(path))
+
+    def register_model(self, spec) -> None:
+        """Plug a new model into the bridge (see models.ModelSpec)."""
+        self.register_model_fn(spec)
 
     def ask_agent(self, message: str) -> str:
         """Run a one-off query through the current AI agent."""
@@ -127,6 +134,7 @@ class PluginManager:
             call_agent=self._handles["call_agent"],
             memory=self._handles["memory"],
             scheduler=self._handles["scheduler"],
+            register_model_fn=self._handles.get("register_model_fn"),
             user_id=user_id,
             context_token=context_token,
             working_dir=working_dir,
@@ -243,14 +251,13 @@ class PluginManager:
             plugins = list(self._plugins)
         if not plugins:
             return (
-                "No plugins loaded.\n"
-                f"Add .py files to: {PLUGIN_DIR}"
+                f"🔌 还没有插件。\n把 .py 文件放进 {PLUGIN_DIR} 即可。"
             )
-        lines = [f"Loaded plugins ({len(plugins)}):\n"]
+        lines = [f"## 🔌 已加载插件 · {len(plugins)}", ""]
         for p in plugins:
-            lines.append(f"  {p.name} — {p.description or '(no description)'}")
+            lines.append(fmt.section(f"{p.name} — {p.description or '(无描述)'}"))
             for c, help_text in p.commands.items():
-                lines.append(f"    {help_text or c}")
+                lines.append(f"  {help_text or c}")
         return "\n".join(lines)
 
     @property

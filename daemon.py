@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WeClaude daemon — run the WeChat-Claude bridge as a supervised background daemon.
+"""Kami daemon — run the WeChat bot bridge as a supervised background daemon.
 
 The supervisor keeps two things alive:
   - bridge.py: spawned and restarted with exponential backoff when it crashes
@@ -23,20 +23,22 @@ Usage:
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
+from typing import Callable
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 BRIDGE = BASE_DIR / "bridge.py"
-CONFIG_DIR = Path.home() / ".config" / "wechat-claude-bridge"
+from paths import CONFIG_DIR
 PID_FILE = CONFIG_DIR / "daemon.pid"
 STATUS_FILE = CONFIG_DIR / "daemon_status.json"
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "weclaude.log"
-TASK_NAME = "WeClaude"
+TASK_NAME = "Kami"
 
 SUPERVISE_CMD = "__supervise"  # internal: run the supervisor loop
 
@@ -44,6 +46,8 @@ RESET_BACKOFF_AFTER = 600  # seconds of uptime that count as "stable"
 RESTART_DELAY_CAP = 120  # max seconds between bridge restarts
 CCSWITCH_CHECK_INTERVAL = 30  # seconds between cc-switch liveness checks
 LLAMA_PORT = 8899  # llama-server listen port (bridge expects this)
+VL_PORT = 8188  # Qwen3-VL server port (bridge expects this)
+CONTROL_PORT = 8800  # control server (webui + adb report endpoint)
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -74,6 +78,23 @@ def _find_llama() -> Path | None:
             if exe.is_file():
                 return exe
     return None
+
+
+def _find_vl_files(exe: Path) -> tuple[Path, Path] | None:
+    """Find a Qwen3-VL model + mmproj projector next to llama-server.exe."""
+    vl_models = [
+        p
+        for p in exe.parent.glob("*Qwen3*VL*.gguf")
+        if not p.name.lower().startswith("mmproj")
+    ]
+    if not vl_models:
+        return None
+    mmproj = next(iter(exe.parent.glob("mmproj*Qwen3*VL*.gguf")), None)
+    if mmproj is None:
+        mmproj = next(iter(exe.parent.glob("mmproj*.gguf")), None)
+    if mmproj is None:
+        return None
+    return vl_models[0], mmproj
 
 # The daemon must run fully silent: console children (bridge, tasklist,
 # taskkill, schtasks) spawned from a console-less parent would otherwise
@@ -185,6 +206,52 @@ def _pid_alive(pid: int) -> bool:
         return True
     except (ProcessLookupError, PermissionError):
         return False
+
+
+def _supervisor_pids() -> list[int]:
+    """Live supervisor PIDs found by command line (robust vs stale pid file).
+
+    The pid file alone can go stale or the tasklist probe can flake right
+    after wake — two supervisors would then poll the same WeChat account and
+    fight over the message cursor ("frequent disconnects"). Match the
+    __supervise command line instead.
+    """
+    try:
+        if IS_WINDOWS:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_Process "
+                    "-Filter \"Name like 'python%'\" | "
+                    "Where-Object {$_.CommandLine -match 'daemon(.__supervise)?.*py'} | "
+                    "Where-Object {$_.CommandLine -match '__supervise'} | "
+                    "Select-Object -ExpandProperty ProcessId",
+                ],
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                **_SILENT,
+            )
+            return [
+                int(x)
+                for x in (result.stdout or "").split()
+                if x.strip().isdigit()
+            ]
+        result = subprocess.run(
+            ["pgrep", "-f", f"{Path(__file__).name}.*{SUPERVISE_CMD}"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        return [
+            int(x) for x in (result.stdout or "").split() if x.strip().isdigit()
+        ]
+    except Exception:
+        return []  # probe failed — fall back to pid-file-only logic
 
 
 def _image_running(image: str) -> bool:
@@ -326,11 +393,25 @@ def _ensure_ccswitch(exe: Path, stop: threading.Event) -> None:
 
 
 def _ensure_llamaserver(exe: Path, model: Path, stop: threading.Event) -> None:
-    """Periodically check llama-server; open it whenever it is not running."""
-    image = exe.name
+    """Periodically check the text llama-server; open it when not running.
+
+    Health is a PORT probe, not a process-name check: llama-server.exe is
+    shared with the VL server, so a name check sees the VL process and never
+    revives this one after an OOM death.
+    """
+    import socket
+
+    def up() -> bool:
+        try:
+            s = socket.create_connection(("127.0.0.1", LLAMA_PORT), timeout=1.5)
+            s.close()
+            return True
+        except OSError:
+            return False
+
     while not stop.is_set():
         try:
-            if not _image_running(image):
+            if not up():
                 cmd = [
                     str(exe),
                     "-m",
@@ -343,8 +424,11 @@ def _ensure_llamaserver(exe: Path, model: Path, stop: threading.Event) -> None:
                     "99",  # offload all layers to GPU
                     "-c",
                     "4096",
+                    "--cache-reuse",
+                    "256",  # reuse KV for the shared prompt prefix (faster)
                 ]
-                _log(f"{image} not running, starting (model={model.name})")
+                _log("llamaserver not listening, starting "
+                     f"(model={model.name})")
                 # Server logs to its own file / console; keep it off ours.
                 proc = subprocess.Popen(
                     cmd,
@@ -362,10 +446,128 @@ def _ensure_llamaserver(exe: Path, model: Path, stop: threading.Event) -> None:
         stop.wait(CCSWITCH_CHECK_INTERVAL)
 
 
+def _ensure_control_server(stop: threading.Event) -> None:
+    """Periodically check the control server; start it when not listening."""
+    import socket
+
+    def up() -> bool:
+        try:
+            s = socket.create_connection(("127.0.0.1", 8800), timeout=1.5)
+            s.close()
+            return True
+        except OSError:
+            return False
+
+    while not stop.is_set():
+        try:
+            if not up():
+                _log("control server not listening, starting on 0.0.0.0:8800")
+                with _open_log() as logf:
+                    logf.write(
+                        f"{time.strftime('%F %T')} ── launching control server ──\n"
+                    )
+                    proc = subprocess.Popen(
+                        [sys.executable, str(BASE_DIR / "control_server.py"),
+                         "--host", "0.0.0.0", "--port", "8800"],
+                        cwd=str(BASE_DIR),
+                        stdout=logf,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        env=_child_env(),
+                        **_SILENT,
+                    )
+                _set_status("control", proc.pid)
+                _log(f"control server opened (pid {proc.pid})")
+                stop.wait(5)
+        except Exception as e:
+            _log(f"control server launch failed: {e}")
+        stop.wait(CCSWITCH_CHECK_INTERVAL)
+
+
+
+def _run_forever(fn: Callable, *args) -> None:
+    """Thread wrapper: a crashed worker logs and restarts itself instead of
+    silently killing the whole supervisor (daemon threads take python down)."""
+    while True:
+        try:
+            fn(*args)
+        except Exception as e:
+            _log(f"{fn.__name__} crashed: {e!r} — restarting in 5s")
+        time.sleep(5)
+
+
+def _ensure_vlserver(exe: Path, model: Path, mmproj: Path, stop: threading.Event) -> None:
+    """Periodically check the Qwen3-VL server; open it when not running."""
+    import socket
+
+    def up() -> bool:
+        # Port probe, not process name: llama-server.exe is shared with the
+        # 8899 text model, so a name check would see the text server and
+        # never start the VL one after a fresh boot.
+        try:
+            s = socket.create_connection(("127.0.0.1", VL_PORT), timeout=1.5)
+            s.close()
+            return True
+        except OSError:
+            return False
+
+    # Stagger: let the 8899 text model load first — both loading at once
+    # spikes VRAM and OOM-kills whichever loses the race on the 8GB GPU.
+    stop.wait(25)
+
+    while not stop.is_set():
+        try:
+            if not up():
+                cmd = [
+                    str(exe),
+                    "-m",
+                    str(model),
+                    "--mmproj",
+                    str(mmproj),
+                    "--port",
+                    str(VL_PORT),
+                    "--host",
+                    "127.0.0.1",
+                    "-c",
+                    "8192",
+                    "-ngl",
+                    "99",
+                    "--flash-attn",
+                    "auto",
+                    "--cache-reuse",
+                    "256",
+                    "--jinja",  # required for the VL chat template
+                ]
+                _log(f"VL server not running, starting (model={model.name})")
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(exe.parent),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    **_SILENT,
+                )
+                _set_status("vlserver", proc.pid)
+                _log(f"vlserver opened (pid {proc.pid})")
+                stop.wait(30)  # model load time before the next check
+        except Exception as e:
+            _log(f"vlserver launch failed: {e}")
+        stop.wait(CCSWITCH_CHECK_INTERVAL)
+
+
 def _supervise(
     workdir: str | None, ccswitch: Path | None, llama: Path | None
 ) -> None:
     """Run forever: bridge supervised with restart, ccswitch kept alive."""
+    # Single-instance guard: never allow two supervisors (two pollers fight
+    # over the WeChat message cursor and everything looks disconnected).
+    others = [p for p in _supervisor_pids() if p != os.getpid()]
+    if others:
+        _log(
+            f"Another supervisor already running (pid {others[0]}), exiting."
+        )
+        return
+
     pid = os.getpid()
     _write_pid(pid)
     _set_status("supervisor", pid)
@@ -378,11 +580,18 @@ def _supervise(
 
     stop = threading.Event()
     threads = [
-        threading.Thread(target=_supervise_bridge, args=(workdir, stop), daemon=True)
+        threading.Thread(
+            target=_run_forever, args=(_supervise_bridge, workdir, stop), daemon=True
+        ),
+        threading.Thread(
+            target=_run_forever, args=(_ensure_control_server, stop), daemon=True
+        ),
     ]
     if ccswitch is not None:
         threads.append(
-            threading.Thread(target=_ensure_ccswitch, args=(ccswitch, stop), daemon=True)
+            threading.Thread(
+                target=_run_forever, args=(_ensure_ccswitch, ccswitch, stop), daemon=True
+            )
         )
     if llama is not None:
         model = _find_llama_model(llama)
@@ -391,9 +600,20 @@ def _supervise(
         else:
             threads.append(
                 threading.Thread(
-                    target=_ensure_llamaserver, args=(llama, model, stop), daemon=True
+                    target=_run_forever,
+                    args=(_ensure_llamaserver, llama, model, stop),
+                    daemon=True,
                 )
             )
+            vl = _find_vl_files(llama)
+            if vl is not None:
+                threads.append(
+                    threading.Thread(
+                        target=_run_forever,
+                        args=(_ensure_vlserver, llama, vl[0], vl[1], stop),
+                        daemon=True,
+                    )
+                )
     for t in threads:
         t.start()
 
@@ -423,6 +643,10 @@ def _is_running() -> int | None:
 
 def cmd_start(workdir: str | None, ccswitch: Path | None, llama: Path | None) -> None:
     running = _is_running()
+    if not running:
+        # Pid file can be stale / tasklist flaky — confirm by command line.
+        pids = _supervisor_pids()
+        running = pids[0] if pids else None
     if running:
         _print(f"Daemon already running (pid {running}).")
         return
@@ -500,8 +724,27 @@ def cmd_status() -> None:
         print("  llamaserver: not installed")
     elif _image_running(llama.name):
         print(f"  llamaserver: running (port {LLAMA_PORT})")
+        try:
+            import httpx
+
+            vl_ok = (
+                httpx.get(f"http://127.0.0.1:{VL_PORT}/health", timeout=2).status_code
+                == 200
+            )
+        except Exception:
+            vl_ok = False
+        vl = _find_vl_files(llama)
+        if vl is None:
+            print("  vlserver (Qwen3-VL): model not found, skipped")
+        elif vl_ok:
+            print(f"  vlserver (Qwen3-VL): running (port {VL_PORT})")
+        else:
+            print(f"  vlserver (Qwen3-VL): starting/loading (port {VL_PORT})")
     else:
         print("  llamaserver: not running (daemon will open it within 30s)")
+
+    # Phone ADB watchdog lives in the adb plugin now (see plugins/adb.py);
+    # check it from WeChat with /phone.
     print(f"Log: {LOG_FILE}")
 
 
@@ -561,7 +804,7 @@ def cmd_uninstall_autostart() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="WeClaude daemon controller")
+    parser = argparse.ArgumentParser(description="Kami daemon controller")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, **kw) -> argparse.ArgumentParser:

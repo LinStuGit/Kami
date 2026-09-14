@@ -16,9 +16,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
+import fmt
+
 logger = logging.getLogger(__name__)
 
-JOBS_FILE = Path.home() / ".config" / "wechat-claude-bridge" / "jobs.json"
+from paths import CONFIG_DIR
+
+JOBS_FILE = CONFIG_DIR / "jobs.json"
 
 
 def _parse_interval(spec: str) -> int | None:
@@ -240,7 +244,8 @@ class Scheduler:
         ts = _parse_time_spec(time_spec)
         if ts is None:
             return (
-                f"Invalid time: '{time_spec}'\nFormats: 17:00, in 30m, 2026-03-25 09:00"
+                f"⚠️ 时间格式看不懂：「{time_spec}」\n"
+                "试试 17:00 · in 30m · 2026-03-25 09:00"
             )
 
         job = Job(
@@ -256,9 +261,10 @@ class Scheduler:
         self._save_jobs()
 
         dt = datetime.fromtimestamp(ts)  # noqa: DTZ006
-        return (
-            f"Reminder set [{job.job_id}]: {message}\n"
-            f"At: {dt.strftime('%Y-%m-%d %H:%M')}"
+        return fmt.block(
+            "⏰", f"提醒已设 · {job.job_id}",
+            fmt.kv("时间", dt.strftime("%m-%d %H:%M")),
+            fmt.kv("内容", message[:60]),
         )
 
     def add_interval(
@@ -281,7 +287,7 @@ class Scheduler:
         """
         secs = _parse_interval(interval)
         if secs is None:
-            return f"Invalid interval: '{interval}'\nFormats: 30s, 5m, 2h, 1d"
+            return f"⚠️ 间隔格式看不懂：「{interval}」\n试试 30s · 5m · 2h · 1d"
 
         job = Job(
             job_id=uuid.uuid4().hex[:8],
@@ -296,7 +302,12 @@ class Scheduler:
             self._jobs.append(job)
         self._save_jobs()
 
-        return f"Interval task set [{job.job_id}]: every {interval}\nMessage: {message}"
+        return fmt.block(
+            "🔁", f"循环任务 · {job.job_id}",
+            fmt.kv("间隔", f"每 {interval}"),
+            fmt.kv("内容", message[:60]),
+            ("🤖 结果经 Claude 处理" if run_claude else ""),
+        )
 
     def add_cron(
         self,
@@ -319,9 +330,8 @@ class Scheduler:
         fields = cron_expr.strip().split()
         if len(fields) != 5:
             return (
-                f"Invalid cron expression: '{cron_expr}'\n"
-                "Format: minute hour day month weekday\n"
-                "Example: 0 9 * * 1-5"
+                "⚠️ cron 表达式需要 5 段：分 时 日 月 周\n"
+                "例：/cron 0 9 * * 1-5 早报"
             )
 
         job = Job(
@@ -337,7 +347,12 @@ class Scheduler:
             self._jobs.append(job)
         self._save_jobs()
 
-        return f"Cron task set [{job.job_id}]: {cron_expr}\nMessage: {message}"
+        return fmt.block(
+            "📅", f"cron 任务 · {job.job_id}",
+            fmt.kv("表达式", cron_expr),
+            fmt.kv("内容", message[:60]),
+            ("🤖 结果经 Claude 处理" if run_claude else ""),
+        )
 
     def list_jobs(self, user_id: str) -> str:
         """List all jobs for a user.
@@ -352,26 +367,30 @@ class Scheduler:
             user_jobs = [j for j in self._jobs if j.user_id == user_id]
 
         if not user_jobs:
-            return "No scheduled jobs.\nUse /remind, /every, or /cron to create."
+            return ("⏰ 还没有定时任务。\n"
+                    "/remind 17:00 提交代码 · /every 2h 巡检 · /cron …")
 
-        lines = ["Scheduled jobs:\n"]
-        for j in user_jobs:
-            status = "on" if j.enabled else "off"
+        lines = [f"## ⏰ 定时任务 · {len(user_jobs)}", ""]
+        for i, j in enumerate(user_jobs):
+            status = "🟢" if j.enabled else "⚪"
             if j.job_type == "once":
                 dt = datetime.fromtimestamp(j.next_run)  # noqa: DTZ006
                 when = dt.strftime("%m-%d %H:%M")
+                kind = "单次"
             elif j.job_type == "interval":
-                when = f"every {j.schedule}"
+                when = f"每 {j.schedule}"
+                kind = "循环"
             else:
                 when = j.schedule
+                kind = "cron"
 
-            claude_tag = " [claude]" if j.run_claude else ""
+            claude_tag = " 🤖" if j.run_claude else ""
             lines.append(
-                f"  {j.job_id} [{status}] {j.job_type}: "
-                f"{when} — {j.message[:30]}{claude_tag}"
+                f"{fmt.CIRCLED[i]} {status} {kind} {when}{claude_tag}"
             )
+            lines.append(f"   {j.message[:40]}")
 
-        lines.append("\n/cancel <id> to remove")
+        lines.append(fmt.footer("/cancel id 取消"))
         return "\n".join(lines)
 
     def cancel_job(self, user_id: str, job_id: str) -> str:
@@ -384,17 +403,19 @@ class Scheduler:
         Returns:
             Confirmation or error message.
         """
-        found = False
+        found = None
         with self._lock:
             for i, j in enumerate(self._jobs):
                 if j.job_id == job_id and j.user_id == user_id:
-                    self._jobs.pop(i)
-                    found = True
+                    found = self._jobs.pop(i)
                     break
         if found:
             self._save_jobs()
-            return f"Job {job_id} cancelled."
-        return f"Job '{job_id}' not found."
+            return fmt.block(
+                "🗑", f"任务已取消 · {found.job_id}",
+                fmt.kv("内容", found.message[:60]),
+            )
+        return f"🔍 找不到任务 {job_id}。/jobs 查看。"
 
     def start(self) -> None:
         """Start the scheduler background thread."""

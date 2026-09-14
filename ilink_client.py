@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
 CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 CHANNEL_VERSION = "1.0.2"
-CONFIG_DIR = Path.home() / ".config" / "wechat-claude-bridge"
+from paths import CONFIG_DIR
 TOKEN_FILE = CONFIG_DIR / "token.json"
 CURSOR_FILE = CONFIG_DIR / "cursor.dat"
 POLL_TIMEOUT_S = 40  # slightly above server's 35s hold
@@ -98,7 +98,11 @@ class ILinkClient:
         self.bot_token: str | None = None
         self.base_url: str = ILINK_BASE_URL
         self._cursor: str = ""  # getupdates cursor
-        self._client = httpx.Client(timeout=POLL_TIMEOUT_S + 5)
+        self._bad_rets = 0  # consecutive session-rejected polls
+        self._client = httpx.Client(
+            timeout=POLL_TIMEOUT_S + 5,
+            trust_env=False,  # system proxy (e.g. 127.0.0.1:7897) hangs long-polls
+        )
         self._try_restore_token()
         self._cursor = self._load_cursor()
         self._typing_ticket: str = ""
@@ -109,6 +113,21 @@ class ILinkClient:
             self.bot_token = data.get("bot_token")
             self.base_url = _validate_base_url(data.get("base_url", ILINK_BASE_URL))
             logger.info("Restored saved token.")
+
+    def _maybe_reload_token(self) -> bool:
+        """Pick up a re-login another process wrote to token.json.
+
+        Returns True if the in-memory token changed.
+        """
+        data = _load_token()
+        if data and data.get("bot_token") != self.bot_token:
+            self.bot_token = data.get("bot_token")
+            self.base_url = _validate_base_url(
+                data.get("base_url", ILINK_BASE_URL)
+            )
+            logger.info("Token changed on disk — reloaded.")
+            return True
+        return False
 
     def _load_cursor(self) -> str:
         try:
@@ -254,8 +273,31 @@ class ILinkClient:
 
         ret = data.get("ret")
         if ret is not None and ret != 0:
-            logger.warning("getupdates: ret=%s errmsg=%s", ret, data.get("errmsg", ""))
+            self._bad_rets += 1
+            # Stale updates cursor from a dead session is rejected — drop
+            # it and let the loop retry from the live buffer.
+            if self._cursor:
+                logger.info("getupdates rejected — resetting stale cursor.")
+                self._cursor = ""
+                self._save_cursor()
+                self._bad_rets = 0
+                return []
+            # Next suspect: a re-login elsewhere refreshed token.json.
+            if self._maybe_reload_token():
+                self._bad_rets = 0
+                return []
+            logger.warning(
+                "getupdates: ret=%s errmsg=%s (%d/3)",
+                ret, data.get("errmsg", ""), self._bad_rets,
+            )
+            if self._bad_rets >= 3:
+                self._bad_rets = 0
+                raise RuntimeError(
+                    f"getupdates rejected (ret={ret}) — session invalid"
+                )
+            time.sleep(2)
             return []
+        self._bad_rets = 0
 
         # Update cursor for next poll
         new_cursor = data.get("get_updates_buf", "")
@@ -312,7 +354,7 @@ class ILinkClient:
         """Send a text message back to the user."""
         chunks = self._split_text(text, max_len=4000)
         for chunk in chunks:
-            client_id = f"wechat-claude-bridge:{uuid.uuid4().hex[:16]}"
+            client_id = f"kami:{uuid.uuid4().hex[:16]}"
             payload = {
                 "msg": {
                     "from_user_id": "",
@@ -434,7 +476,7 @@ class ILinkClient:
         context_token: str,
         item: dict,
     ) -> bool:
-        client_id = f"wechat-claude-bridge:{uuid.uuid4().hex[:16]}"
+        client_id = f"kami:{uuid.uuid4().hex[:16]}"
         payload = {
             "msg": {
                 "from_user_id": "",

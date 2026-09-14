@@ -19,7 +19,9 @@ from llm_local import ask_local
 
 logger = logging.getLogger(__name__)
 
-MEMORY_DIR = Path.home() / ".config" / "wechat-claude-bridge" / "memory"
+from paths import CONFIG_DIR
+
+MEMORY_DIR = CONFIG_DIR / "memory"
 MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
 _lock = threading.Lock()
 

@@ -1,5 +1,6 @@
 package com.kami.ipreport
 
+import android.content.pm.PackageManager
 import android.os.ParcelFileDescriptor
 import moe.shizuku.server.IShizukuService
 import rikka.shizuku.Shizuku

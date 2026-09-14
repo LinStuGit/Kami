@@ -35,3 +35,10 @@ logs/
 # Android/Gradle build artifacts
 .gradle/
 local.properties
+
+# CI debugging scratch files
+api.aar
+ann.json
+cr.json
+jobs.json
+job_*.log

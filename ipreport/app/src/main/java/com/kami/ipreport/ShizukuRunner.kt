@@ -1,5 +1,6 @@
 package com.kami.ipreport
 
+import android.os.ParcelFileDescriptor
 import moe.shizuku.server.IShizukuService
 import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuBinderWrapper
@@ -18,11 +19,13 @@ object ShizukuRunner {
     /** Run one shell command; returns combined output ("" on failure). */
     fun run(cmd: String): String = try {
         val service = IShizukuService.Stub.asInterface(
-            ShizukuBinderWrapper(Shizuku.getBinder())
+            ShizukuBinderWrapper(Shizuku.getBinder()!!)
         )
         val p = service.newProcess(arrayOf("sh", "-c", cmd), null, null)
-        val out = p.inputStream.bufferedReader().readText()
-        val err = p.errorStream.bufferedReader().readText()
+        val out = ParcelFileDescriptor.AutoCloseInputStream(p.inputStream)
+            .bufferedReader().readText()
+        val err = ParcelFileDescriptor.AutoCloseInputStream(p.errorStream)
+            .bufferedReader().readText()
         p.waitFor()
         (out + err).trim()
     } catch (t: Throwable) {

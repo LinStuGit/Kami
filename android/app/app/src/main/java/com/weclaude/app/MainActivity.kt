@@ -100,11 +100,15 @@ class MainActivity : Activity() {
         fun shizukuExec(cmd: String) {
             val output = try {
                 val service = moe.shizuku.server.IShizukuService.Stub.asInterface(
-                    rikka.shizuku.ShizukuBinderWrapper(Shizuku.getBinder())
+                    rikka.shizuku.ShizukuBinderWrapper(Shizuku.getBinder()!!)
                 )
                 val p = service.newProcess(arrayOf("sh", "-c", cmd), null, null)
-                val out = p.inputStream.bufferedReader().readText()
-                val err = p.errorStream.bufferedReader().readText()
+                val inStream = android.os.ParcelFileDescriptor
+                    .AutoCloseInputStream(p.inputStream)
+                val errStream = android.os.ParcelFileDescriptor
+                    .AutoCloseInputStream(p.errorStream)
+                val out = inStream.bufferedReader().readText()
+                val err = errStream.bufferedReader().readText()
                 p.waitFor()
                 (out + err).trim().ifEmpty { "(ok, no output)" }
             } catch (e: Throwable) {
